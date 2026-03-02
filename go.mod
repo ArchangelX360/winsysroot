@@ -1,6 +1,6 @@
 module git.dolansoft.org/lorenz/winsysroot
 
-go 1.16
+go 1.22
 
 require (
 	github.com/klauspost/compress v1.15.6
