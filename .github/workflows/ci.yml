@@ -76,12 +76,14 @@ jobs:
           merge-multiple: true
 
       - name: Attach assets to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/winsysroot-linux-amd64
-            dist/winsysroot-linux-arm64
-            dist/winsysroot-darwin-amd64
-            dist/winsysroot-darwin-arm64
-            dist/winsysroot-windows-amd64.exe
-            dist/winsysroot-windows-arm64.exe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            dist/winsysroot-linux-amd64 \
+            dist/winsysroot-linux-arm64 \
+            dist/winsysroot-darwin-amd64 \
+            dist/winsysroot-darwin-arm64 \
+            dist/winsysroot-windows-amd64.exe \
+            dist/winsysroot-windows-arm64.exe \
+            --clobber
