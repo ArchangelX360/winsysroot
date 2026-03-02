@@ -3,9 +3,6 @@ name: CI and Release Binaries
 on:
   pull_request:
   push:
-  release:
-    types:
-      - created
 
 permissions:
   contents: read
@@ -61,9 +58,9 @@ jobs:
           name: winsysroot-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/winsysroot-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
 
-  attach-release-assets:
-    name: Attach binaries to release
-    if: github.event_name == 'release'
+  publish-master-release:
+    name: Publish binaries for master
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -75,17 +72,29 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Attach assets to release
+      - name: Create or update release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            --repo "$GH_REPO" \
-            dist/winsysroot-linux-amd64 \
-            dist/winsysroot-linux-arm64 \
-            dist/winsysroot-darwin-amd64 \
-            dist/winsysroot-darwin-arm64 \
-            dist/winsysroot-windows-amd64.exe \
-            dist/winsysroot-windows-arm64.exe \
-            --clobber
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+          TAG="master-${SHORT_SHA}"
+          ASSETS=(
+            dist/winsysroot-linux-amd64
+            dist/winsysroot-linux-arm64
+            dist/winsysroot-darwin-amd64
+            dist/winsysroot-darwin-arm64
+            dist/winsysroot-windows-amd64.exe
+            dist/winsysroot-windows-arm64.exe
+          )
+
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GH_REPO" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$TAG" \
+              --repo "$GH_REPO" \
+              --target "$GITHUB_SHA" \
+              --title "master ${SHORT_SHA}" \
+              --notes "Automated release for commit ${GITHUB_SHA} on master." \
+              "${ASSETS[@]}"
+          fi
