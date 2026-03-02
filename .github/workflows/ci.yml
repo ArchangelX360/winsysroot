@@ -78,8 +78,10 @@ jobs:
       - name: Attach assets to release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
+            --repo "$GH_REPO" \
             dist/winsysroot-linux-amd64 \
             dist/winsysroot-linux-arm64 \
             dist/winsysroot-darwin-amd64 \
