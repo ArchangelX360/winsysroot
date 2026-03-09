@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -21,42 +22,13 @@ func buildWinSDK(version string, architectures []string, slim bool, manifest Ins
 	for _, arch := range architectures {
 		hasArch[arch] = true
 	}
-	packageRegexp := regexp.MustCompile(`^Win.*SDK_` + regexp.QuoteMeta(version) + "$")
-	var sdkPkg Package
-	for _, pkg := range manifest.Packages {
-		if packageRegexp.MatchString(pkg.ID) {
-			sdkPkg = pkg
-			break
-		}
+	sdkPkg, err := findWinSDKPackage(manifest, version)
+	if err != nil {
+		log.Fatal(err)
 	}
-	if sdkPkg.ID == "" {
-		log.Fatalf("Failed to find Windows SDK with specified version")
-	}
-	cabs := make(map[string]*msi.MSI)
-	for _, payload := range sdkPkg.Payloads {
-		if strings.HasSuffix(payload.FileName, ".msi") {
-			res, err := handleHTTPError(http.Get(payload.URL))
-			if err != nil {
-				log.Fatalf("failed to download MSI %v: %v", payload.FileName, err)
-			}
-			msiRaw, err := io.ReadAll(res.Body)
-			if err != nil {
-				log.Fatalf("failed to read MSI %v: %v", payload.FileName, err)
-			}
-			res.Body.Close()
-			msiData, err := msi.Parse(bytes.NewReader(msiRaw))
-			if err != nil {
-				log.Fatalf("failed to parse MSI %v: %v", payload.FileName, err)
-			}
-			for _, targetFile := range msiData.FileMap {
-				if includeRegexp.MatchString(targetFile) || libRegexp.MatchString(targetFile) {
-					for _, cab := range msiData.CABFiles {
-						cabs[strings.ToLower(cab)] = msiData
-					}
-					break
-				}
-			}
-		}
+	cabs, err := discoverWinSDKCabMSIInfo(sdkPkg)
+	if err != nil {
+		log.Fatal(err)
 	}
 	for _, payload := range sdkPkg.Payloads {
 		parts := strings.Split(payload.FileName, "\\")
@@ -123,4 +95,44 @@ func buildWinSDK(version string, architectures []string, slim bool, manifest Ins
 			}
 		}
 	}
+}
+
+func findWinSDKPackage(manifest InstallerManifest, version string) (Package, error) {
+	packageRegexp := regexp.MustCompile(`^Win.*SDK_` + regexp.QuoteMeta(version) + "$")
+	for _, pkg := range manifest.Packages {
+		if packageRegexp.MatchString(pkg.ID) {
+			return pkg, nil
+		}
+	}
+	return Package{}, fmt.Errorf("failed to find Windows SDK package for version %q", version)
+}
+
+func discoverWinSDKCabMSIInfo(sdkPkg Package) (map[string]*msi.MSI, error) {
+	cabs := make(map[string]*msi.MSI)
+	for _, payload := range sdkPkg.Payloads {
+		if strings.HasSuffix(strings.ToLower(payload.FileName), ".msi") {
+			res, err := handleHTTPError(http.Get(payload.URL))
+			if err != nil {
+				return nil, fmt.Errorf("failed to download MSI %v: %w", payload.FileName, err)
+			}
+			msiRaw, err := io.ReadAll(res.Body)
+			res.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("failed to read MSI %v: %w", payload.FileName, err)
+			}
+			msiData, err := msi.Parse(bytes.NewReader(msiRaw))
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse MSI %v: %w", payload.FileName, err)
+			}
+			for _, targetFile := range msiData.FileMap {
+				if includeRegexp.MatchString(targetFile) || libRegexp.MatchString(targetFile) {
+					for _, cab := range msiData.CABFiles {
+						cabs[strings.ToLower(cab)] = msiData
+					}
+					break
+				}
+			}
+		}
+	}
+	return cabs, nil
 }
