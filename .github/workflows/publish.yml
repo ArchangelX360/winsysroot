@@ -31,8 +31,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          SHORT_SHA="${GITHUB_SHA:0:12}"
-          TAG="master-${SHORT_SHA}"
+          TAG="master-${GITHUB_SHA}"
           ASSETS=(
             dist/winsysroot-linux-amd64
             dist/winsysroot-linux-arm64
@@ -48,7 +47,7 @@ jobs:
             gh release create "$TAG" \
               --repo "$GH_REPO" \
               --target "$GITHUB_SHA" \
-              --title "master ${SHORT_SHA}" \
+              --title "master-${GITHUB_SHA}" \
               --notes "Automated release for commit ${GITHUB_SHA} on master." \
               "${ASSETS[@]}"
           fi
