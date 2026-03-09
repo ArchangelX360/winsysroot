@@ -27,6 +27,7 @@ var (
 	flagSlim            = flag.Bool("slim", true, "Strip most excess files, ship only headers, libraries and object files. Also strips separate onecore, store and uwp libraries.")
 	flagOutDir          = flag.String("out-dir", "", "Output sysroot under this directory. Exclusive with --out-tar.")
 	flagOutTar          = flag.String("out-tar", "", "Output sysroot to a zstd-compressed tarball at the path given to this argument. Exclusive with --out-dir.")
+	flagOutManifest     = flag.String("out-manifest", "", "Write a JSON manifest of the downloads winsysroot would perform. Exclusive with --out-dir and --out-tar.")
 	flagListSDKVersions = flag.Bool("list-win-sdk-versions", false, "List available Windows SDK versions and exit")
 )
 
@@ -90,6 +91,20 @@ func main() {
 			if len(res) > 0 {
 				fmt.Printf("%v\n", res[1])
 			}
+		}
+		return
+	}
+
+	if *flagOutManifest != "" {
+		if *flagOutDir != "" || *flagOutTar != "" {
+			log.Fatalln("--out-manifest is exclusive with --out-dir and --out-tar.")
+		}
+		downloadManifest, err := collectDownloadManifest(*flagVSRelease, *flagWinSDKVersion, architectures, *flagSlim, channel.Info.ID, installerManifest)
+		if err != nil {
+			log.Fatalf("failed to collect output manifest: %v", err)
+		}
+		if err := writeDownloadManifest(*flagOutManifest, downloadManifest); err != nil {
+			log.Fatalf("failed to write output manifest: %v", err)
 		}
 		return
 	}
