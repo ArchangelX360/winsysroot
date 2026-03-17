@@ -2,10 +2,12 @@ package main
 
 import (
 	"archive/zip"
-	"bytes"
+	"fmt"
 	"io"
-	"log"
-	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -17,74 +19,174 @@ var archTools = map[string]string{
 	"x86":     "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
 }
 
-func buildVCTools(manifest InstallerManifest, architectures []string, slim bool, out TargetI) {
-	pkgs := make(map[string]Package)
-	var chase func(ids map[string]interface{})
-	chase = func(ids map[string]interface{}) {
-		for _, pkg := range manifest.Packages {
-			if _, ok := ids[pkg.ID]; !ok {
-				continue
-			}
-			if _, ok := pkgs[pkg.ID]; ok {
-				continue
-			}
-			pkgs[pkg.ID] = pkg
-			if len(pkg.Dependencies) > 0 {
-				chase(pkg.Dependencies)
-			}
-		}
+func collectVCToolsPlan(manifest InstallerManifest, architectures []string, downloadsByName map[string]DownloadEntry) (VCToolsPlan, error) {
+	pkgs, err := collectVCToolsPackages(manifest, architectures)
+	if err != nil {
+		return VCToolsPlan{}, err
 	}
-	hasArch := make(map[string]bool)
-	roots := make(map[string]interface{})
-	for _, arch := range architectures {
-		component := archTools[arch]
-		if component == "" {
-			log.Fatalf("unknown architecture %q, don't know the correct tools package", arch)
-		}
-		roots[component] = true
-		hasArch[arch] = true
+
+	packageIDs := make([]string, 0, len(pkgs))
+	for pkgID := range pkgs {
+		packageIDs = append(packageIDs, pkgID)
 	}
-	chase(roots)
-	log.Printf("Downloading %d packages", len(pkgs))
-	for _, pkg := range pkgs {
+	sort.Strings(packageIDs)
+
+	var vsixDownloads []VCToolsVSIXDownload
+	for _, pkgID := range packageIDs {
+		pkg := pkgs[pkgID]
 		if !strings.EqualFold(pkg.Type, "vsix") {
 			continue
 		}
-		log.Printf("Downloading %s %s", pkg.ID, pkg.Version)
-		res, err := handleHTTPError(http.Get(pkg.Payloads[0].URL))
-		if err != nil {
-			log.Fatalf("failed to download package %v: %v", pkg.ID, err)
+		if len(pkg.Payloads) == 0 {
+			return VCToolsPlan{}, fmt.Errorf("package %s has no payloads", pkg.ID)
 		}
-		payload, err := io.ReadAll(res.Body)
-		if err != nil {
-			log.Fatalf("failed to read package %v: %v", pkg.ID, err)
+		payload := pkg.Payloads[0]
+		downloadPath := path.Join("vctools", sanitizePathComponent(pkg.ID), normalizeManifestPath(payload.FileName))
+		if err := addPlannedDownload(downloadsByName, payloadDownloadEntry(downloadPath, payload.URL, payload.Sha256)); err != nil {
+			return VCToolsPlan{}, err
 		}
-		res.Body.Close()
-		archive, err := zip.NewReader(bytes.NewReader(payload), int64(len(payload)))
-		for _, file := range archive.File {
-			if !strings.HasPrefix(file.Name, "Contents/VC/Tools/MSVC/") {
+		vsixDownloads = append(vsixDownloads, VCToolsVSIXDownload{
+			PackageID:      pkg.ID,
+			PackageVersion: pkg.Version,
+			Download:       downloadPath,
+		})
+	}
+
+	return VCToolsPlan{VSIXDownloads: vsixDownloads}, nil
+}
+
+func collectVCToolsPackages(manifest InstallerManifest, architectures []string) (map[string]Package, error) {
+	pkgsByID := make(map[string]Package)
+	for _, pkg := range manifest.Packages {
+		pkgsByID[pkg.ID] = pkg
+	}
+
+	var pending []string
+	for _, arch := range architectures {
+		component := archTools[arch]
+		if component == "" {
+			return nil, fmt.Errorf("unknown architecture %q, don't know the correct tools package", arch)
+		}
+		if _, ok := pkgsByID[component]; !ok {
+			return nil, fmt.Errorf("failed to find Visual Studio package %s in installer manifest", component)
+		}
+		pending = append(pending, component)
+	}
+
+	selected := make(map[string]Package)
+	seen := make(map[string]bool)
+	for len(pending) > 0 {
+		pkgID := pending[0]
+		pending = pending[1:]
+		if seen[pkgID] {
+			continue
+		}
+		seen[pkgID] = true
+		pkg, ok := pkgsByID[pkgID]
+		if !ok {
+			continue
+		}
+		selected[pkgID] = pkg
+		var dependencyIDs []string
+		for dependencyID := range pkg.Dependencies {
+			dependencyIDs = append(dependencyIDs, dependencyID)
+		}
+		sort.Strings(dependencyIDs)
+		pending = append(pending, dependencyIDs...)
+	}
+
+	return selected, nil
+}
+
+func assembleVCTools(plan *DownloadPlan, downloadsDir string, out TargetI) ([]string, error) {
+	hasArch := make(map[string]bool)
+	for _, arch := range plan.Request.Architectures {
+		hasArch[arch] = true
+	}
+
+	msvcVersions := map[string]bool{}
+
+	for _, plannedVSIX := range plan.VCTools.VSIXDownloads {
+		vsixPath := filepath.Join(downloadsDir, filepath.FromSlash(plannedVSIX.Download))
+		file, err := os.Open(vsixPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open VSIX %s: %w", vsixPath, err)
+		}
+		fileInfo, err := file.Stat()
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to stat VSIX %s: %w", vsixPath, err)
+		}
+		archive, err := zip.NewReader(file, fileInfo.Size())
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to parse VSIX %s: %w", vsixPath, err)
+		}
+		for _, archiveFile := range archive.File {
+			targetPath, version, keep := vctoolsOutputPath(archiveFile.Name, hasArch)
+			if !keep {
 				continue
 			}
-			parts := strings.Split(file.Name, "/")
-			typeDir := strings.ToLower(parts[5])
-			if typeDir != "include" && typeDir != "lib" {
-				continue
+			msvcVersions[version] = true
+			if err := out.Create(targetPath, archiveFile.FileInfo().Size(), archiveFile.FileInfo().ModTime()); err != nil {
+				file.Close()
+				return nil, fmt.Errorf("failed to create output file %s: %w", targetPath, err)
 			}
-			if typeDir == "lib" && !hasArch[strings.ToLower(parts[6])] {
-				continue
-			}
-			targetPath := strings.TrimPrefix(file.Name, "Contents/")
-			if err := out.Create(targetPath, file.FileInfo().Size(), file.FileInfo().ModTime()); err != nil {
-				log.Fatalf("Failed to create output file: %v", err)
-			}
-			f, err := file.Open()
+			reader, err := archiveFile.Open()
 			if err != nil {
-				log.Fatalf("Package %q: failed to open file %q: %v", pkg.ID, file.Name, err)
+				file.Close()
+				return nil, fmt.Errorf("failed to open %s inside %s: %w", archiveFile.Name, vsixPath, err)
 			}
-			if _, err := io.Copy(out, f); err != nil {
-				log.Fatalf("Package %q: failed to copy file %q to target: %v", pkg.ID, file.Name, err)
+			if _, err := io.Copy(out, reader); err != nil {
+				reader.Close()
+				file.Close()
+				return nil, fmt.Errorf("failed to extract %s from %s: %w", archiveFile.Name, vsixPath, err)
 			}
-			f.Close()
+			if err := reader.Close(); err != nil {
+				file.Close()
+				return nil, fmt.Errorf("failed to close %s inside %s: %w", archiveFile.Name, vsixPath, err)
+			}
+		}
+		if err := file.Close(); err != nil {
+			return nil, fmt.Errorf("failed to close VSIX %s: %w", vsixPath, err)
 		}
 	}
+
+	return sortedSetValues(msvcVersions), nil
+}
+
+func vctoolsOutputPath(archivePath string, hasArch map[string]bool) (string, string, bool) {
+	if !strings.HasPrefix(archivePath, "Contents/VC/Tools/MSVC/") {
+		return "", "", false
+	}
+	parts := strings.Split(archivePath, "/")
+	if len(parts) < 6 {
+		return "", "", false
+	}
+	typeDir := strings.ToLower(parts[5])
+	if typeDir != "include" && typeDir != "lib" {
+		return "", "", false
+	}
+	if typeDir == "lib" {
+		if len(parts) < 7 || !hasArch[strings.ToLower(parts[6])] {
+			return "", "", false
+		}
+	}
+	return strings.TrimPrefix(archivePath, "Contents/"), parts[4], true
+}
+
+func assembleFromPlan(plan *DownloadPlan, winsdkMSIDir, downloadsDir string, out TargetI) (*AssemblyMetadata, error) {
+	includeVersions, libVersions, err := assembleWinSDK(plan, winsdkMSIDir, downloadsDir, out)
+	if err != nil {
+		return nil, err
+	}
+	msvcVersions, err := assembleVCTools(plan, downloadsDir, out)
+	if err != nil {
+		return nil, err
+	}
+	return &AssemblyMetadata{
+		MSVCVersions:              msvcVersions,
+		WindowsSDKIncludeVersions: includeVersions,
+		WindowsSDKLibVersions:     libVersions,
+	}, nil
 }

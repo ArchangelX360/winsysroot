@@ -24,14 +24,39 @@ It also requires LLVM 15 or higher with lld-link, which you need to install for 
 
 ## Usage
 
-First, generate a sysroot. If you're content with the defaults (x64 only with SDK 10.0.20348), just
-call
+`winsysroot` is now an offline tool. It does not issue HTTP requests itself; you are expected to
+download the Visual Studio installer manifest, the relevant Windows SDK MSI files, and the planned
+CAB/VSIX payloads externally.
 
-```
-winsysroot --out-dir=somewere/my-sysroot
+The primary workflow is:
+
+```sh
+winsysroot plan \
+  --installer-manifest path/to/installer-manifest.json \
+  --winsdk-msi-dir path/to/msis \
+  --win-sdk-version 10.0.26100 \
+  --architectures x64,arm64 \
+  --out-manifest path/to/download-plan.json
 ```
 
-The full option list can be shown using `--help`.
+followed by:
+
+```sh
+winsysroot assemble \
+  --in-manifest path/to/download-plan.json \
+  --winsdk-msi-dir path/to/msis \
+  --downloads-dir path/to/downloads \
+  --out-dir somewere/my-sysroot \
+  --out-metadata path/to/versions.json
+```
+
+You can list SDK versions from a local installer manifest using:
+
+```sh
+winsysroot list-win-sdk-versions --installer-manifest path/to/installer-manifest.json
+```
+
+The full option list can be shown using `winsysroot help`.
 
 Note that this does NOT need a case-insensitive directory on Linux/MacOS. It doesn't break it, but
 it is also not required.

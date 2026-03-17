@@ -7,42 +7,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
-
-var (
-	flagVSRelease       = flag.String("vs-release", "17", "Major release of Visual Studio to generate sysroot from (like 14, 17, ..)")
-	flagWinSDKVersion   = flag.String("win-sdk-version", "10.0.20348", "Version of the Windows SDK to use, without the patch version (e.g. 10.0.20348)")
-	flagArchitectures   = flag.String("architectures", "x64", "Comma-separated list of architectures to include in the sysroot. Supported are x86, x64, arm, arm64 and arm64ec.")
-	flagSlim            = flag.Bool("slim", true, "Strip most excess files, ship only headers, libraries and object files. Also strips separate onecore, store and uwp libraries.")
-	flagOutDir          = flag.String("out-dir", "", "Output sysroot under this directory. Exclusive with --out-tar.")
-	flagOutTar          = flag.String("out-tar", "", "Output sysroot to a zstd-compressed tarball at the path given to this argument. Exclusive with --out-dir.")
-	flagListSDKVersions = flag.Bool("list-win-sdk-versions", false, "List available Windows SDK versions and exit")
-)
-
-func handleHTTPError(res *http.Response, err error) (*http.Response, error) {
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode != http.StatusOK {
-		errorMsg, err := ioutil.ReadAll(io.LimitReader(res.Body, 1024))
-		if err != nil {
-			return nil, fmt.Errorf("HTTP %d: %w", res.StatusCode, err)
-		}
-		return nil, fmt.Errorf("HTTP %d: %s", res.StatusCode, string(errorMsg))
-	}
-	return res, nil
-}
 
 type TargetI interface {
 	Create(path string, size int64, modTime time.Time) error
@@ -50,70 +25,222 @@ type TargetI interface {
 }
 
 func main() {
-	flag.Parse()
+	log.SetFlags(0)
 
-	architectures := strings.Split(*flagArchitectures, ",")
+	if len(os.Args) < 2 {
+		printUsageAndExit()
+	}
 
-	res, err := handleHTTPError(http.Get("https://aka.ms/vs/" + *flagVSRelease + "/release/channel"))
+	switch os.Args[1] {
+	case "plan":
+		runPlan(os.Args[2:])
+	case "assemble":
+		runAssemble(os.Args[2:])
+	case "list-win-sdk-versions":
+		runListWinSDKVersions(os.Args[2:])
+	case "help", "-h", "--help":
+		printUsageAndExit()
+	default:
+		log.Fatalf("unknown subcommand %q", os.Args[1])
+	}
+}
+
+func printUsageAndExit() {
+	fmt.Fprintf(os.Stderr, "Usage:\n")
+	fmt.Fprintf(os.Stderr, "  winsysroot plan --installer-manifest <path> --winsdk-msi-dir <dir> --out-manifest <path> [options]\n")
+	fmt.Fprintf(os.Stderr, "  winsysroot assemble --in-manifest <path> --winsdk-msi-dir <dir> --downloads-dir <dir> (--out-dir <dir> | --out-tar <path>) [options]\n")
+	fmt.Fprintf(os.Stderr, "  winsysroot list-win-sdk-versions --installer-manifest <path>\n")
+	os.Exit(2)
+}
+
+func runPlan(args []string) {
+	fs := flag.NewFlagSet("plan", flag.ExitOnError)
+	installerManifestPath := fs.String("installer-manifest", "", "Path to the Visual Studio installer manifest JSON")
+	winsdkMSIDir := fs.String("winsdk-msi-dir", "", "Directory that contains locally downloaded Windows SDK MSI payloads")
+	outManifest := fs.String("out-manifest", "", "Write download plan JSON to this path")
+	winSDKVersion := fs.String("win-sdk-version", "10.0.20348", "Version of the Windows SDK to use, without the patch version (e.g. 10.0.20348)")
+	architectures := fs.String("architectures", "x64", "Comma-separated list of architectures to include in the sysroot. Supported are x86, x64, arm, arm64 and arm64ec.")
+	slim := fs.Bool("slim", true, "Strip most excess files, ship only headers, libraries and object files. Also strips separate onecore, store and uwp libraries.")
+	if err := fs.Parse(args); err != nil {
+		log.Fatal(err)
+	}
+	if *installerManifestPath == "" || *winsdkMSIDir == "" || *outManifest == "" {
+		fs.Usage()
+		log.Fatal("plan requires --installer-manifest, --winsdk-msi-dir, and --out-manifest")
+	}
+
+	installerManifest, err := loadInstallerManifest(*installerManifestPath)
 	if err != nil {
-		log.Fatalf("failed to get channel manifest: %v", err)
+		log.Fatal(err)
 	}
-	var channel ChannelManifest
-	if err := json.NewDecoder(res.Body).Decode(&channel); err != nil {
-		log.Fatalf("failed to parse channel manifest: %v", err)
+	archList, err := splitArchitectures(*architectures)
+	if err != nil {
+		log.Fatal(err)
 	}
-	res.Body.Close()
-	log.Printf("Using channel manifest %v", channel.Info.ID)
-	var installerManifestURL string
-	for _, item := range channel.ChannelItems {
-		if item.ID == "Microsoft.VisualStudio.Manifests.VisualStudio" {
-			installerManifestURL = item.Payloads[0].URL
+
+	plan, err := buildDownloadPlan(installerManifest, *winsdkMSIDir, *winSDKVersion, archList, *slim)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := writeJSONFile(*outManifest, plan); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runAssemble(args []string) {
+	fs := flag.NewFlagSet("assemble", flag.ExitOnError)
+	inManifest := fs.String("in-manifest", "", "Read download plan JSON from this path")
+	winsdkMSIDir := fs.String("winsdk-msi-dir", "", "Directory that contains locally downloaded Windows SDK MSI payloads")
+	downloadsDir := fs.String("downloads-dir", "", "Directory containing Bazel-downloaded CAB and VSIX artifacts")
+	outDir := fs.String("out-dir", "", "Output sysroot under this directory. Exclusive with --out-tar.")
+	outTar := fs.String("out-tar", "", "Output sysroot to a zstd-compressed tarball at the path given to this argument. Exclusive with --out-dir.")
+	outMetadata := fs.String("out-metadata", "", "Optional path for extracted version metadata JSON")
+	if err := fs.Parse(args); err != nil {
+		log.Fatal(err)
+	}
+	if *inManifest == "" || *winsdkMSIDir == "" || *downloadsDir == "" {
+		fs.Usage()
+		log.Fatal("assemble requires --in-manifest, --winsdk-msi-dir, and --downloads-dir")
+	}
+
+	plan, err := loadDownloadPlan(*inManifest)
+	if err != nil {
+		log.Fatal(err)
+	}
+	out, err := newOutputTarget(*outDir, *outTar)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	metadata, err := assembleFromPlan(plan, *winsdkMSIDir, *downloadsDir, out)
+	closeErr := out.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if closeErr != nil {
+		log.Fatalf("failed to finish writing output: %v", closeErr)
+	}
+	if *outMetadata != "" {
+		if err := writeJSONFile(*outMetadata, metadata); err != nil {
+			log.Fatal(err)
 		}
 	}
-	if installerManifestURL == "" {
-		log.Fatalf("could not find installer manifest in channel manifest")
+}
+
+func runListWinSDKVersions(args []string) {
+	fs := flag.NewFlagSet("list-win-sdk-versions", flag.ExitOnError)
+	installerManifestPath := fs.String("installer-manifest", "", "Path to the Visual Studio installer manifest JSON")
+	if err := fs.Parse(args); err != nil {
+		log.Fatal(err)
 	}
-	res, err = handleHTTPError(http.Get(installerManifestURL))
+	if *installerManifestPath == "" {
+		fs.Usage()
+		log.Fatal("list-win-sdk-versions requires --installer-manifest")
+	}
+
+	installerManifest, err := loadInstallerManifest(*installerManifestPath)
 	if err != nil {
-		log.Fatalf("failed to get installer manifest: %v", err)
+		log.Fatal(err)
 	}
-	var installerManifest InstallerManifest
-	if err := json.NewDecoder(res.Body).Decode(&installerManifest); err != nil {
-		log.Fatalf("failed to parse installer manifest: %v", err)
-	}
-	res.Body.Close()
 
-	if *flagListSDKVersions {
-		packageRegexp := regexp.MustCompile(`^Win.*SDK_([0-9.]+)$`)
-		for _, pkg := range installerManifest.Packages {
-			res := packageRegexp.FindStringSubmatch(pkg.ID)
-			if len(res) > 0 {
-				fmt.Printf("%v\n", res[1])
-			}
+	seen := map[string]bool{}
+	packageRegexp := regexp.MustCompile(`^Win.*SDK_([0-9.]+)$`)
+	var versions []string
+	for _, pkg := range installerManifest.Packages {
+		match := packageRegexp.FindStringSubmatch(pkg.ID)
+		if len(match) < 2 || seen[match[1]] {
+			continue
 		}
-		return
+		seen[match[1]] = true
+		versions = append(versions, match[1])
 	}
+	sort.Strings(versions)
+	for _, version := range versions {
+		fmt.Printf("%s\n", version)
+	}
+}
 
-	var out TargetI
+func splitArchitectures(value string) ([]string, error) {
+	var architectures []string
+	seen := map[string]bool{}
+	for _, arch := range strings.Split(value, ",") {
+		arch = strings.TrimSpace(arch)
+		if arch == "" || seen[arch] {
+			continue
+		}
+		seen[arch] = true
+		architectures = append(architectures, arch)
+	}
+	if len(architectures) == 0 {
+		return nil, errors.New("no architectures specified")
+	}
+	return architectures, nil
+}
 
-	if flagOutDir != nil && *flagOutDir != "" {
-		out = newVFSTargetLayer(&directoryTarget{rootDir: *flagOutDir}, *flagOutDir)
-	} else if flagOutTar != nil && *flagOutTar != "" {
-		outInner, err := newArchiveTarget(*flagOutTar)
+func loadInstallerManifest(manifestPath string) (InstallerManifest, error) {
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return InstallerManifest{}, fmt.Errorf("failed to read installer manifest %s: %w", manifestPath, err)
+	}
+	var manifest InstallerManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return InstallerManifest{}, fmt.Errorf("failed to parse installer manifest %s: %w", manifestPath, err)
+	}
+	return manifest, nil
+}
+
+func loadDownloadPlan(planPath string) (*DownloadPlan, error) {
+	raw, err := os.ReadFile(planPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read download plan %s: %w", planPath, err)
+	}
+	var plan DownloadPlan
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		return nil, fmt.Errorf("failed to parse download plan %s: %w", planPath, err)
+	}
+	if plan.SchemaVersion < 2 {
+		return nil, fmt.Errorf("unsupported download plan schema_version %d", plan.SchemaVersion)
+	}
+	return &plan, nil
+}
+
+func writeJSONFile(outputPath string, value interface{}) error {
+	raw, err := json.MarshalIndent(value, "", "\t")
+	if err != nil {
+		return fmt.Errorf("failed to encode JSON for %s: %w", outputPath, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return fmt.Errorf("failed to create parent directories for %s: %w", outputPath, err)
+	}
+	if err := os.WriteFile(outputPath, append(raw, '\n'), 0644); err != nil {
+		return fmt.Errorf("failed to write %s: %w", outputPath, err)
+	}
+	return nil
+}
+
+func normalizeManifestPath(p string) string {
+	return strings.ReplaceAll(p, "\\", "/")
+}
+
+func manifestLocalPath(rootDir, manifestPath string) string {
+	return filepath.Join(rootDir, filepath.FromSlash(normalizeManifestPath(manifestPath)))
+}
+
+func newOutputTarget(outDir, outTar string) (TargetI, error) {
+	if outDir != "" && outTar != "" {
+		return nil, errors.New("--out-dir and --out-tar are mutually exclusive")
+	}
+	if outDir != "" {
+		return newVFSTargetLayer(&directoryTarget{rootDir: outDir}, outDir), nil
+	}
+	if outTar != "" {
+		outInner, err := newArchiveTarget(outTar)
 		if err != nil {
-			log.Fatalf("Failed to create output tar archive: %v", err)
+			return nil, fmt.Errorf("failed to create output tar archive: %w", err)
 		}
-		out = newVFSTargetLayer(outInner, "/winsysroot")
-	} else {
-		log.Fatalln("Please pass either --out-dir or --out-tar to this command.")
+		return newVFSTargetLayer(outInner, "/winsysroot"), nil
 	}
-
-	buildWinSDK(*flagWinSDKVersion, architectures, *flagSlim, installerManifest, out)
-	buildVCTools(installerManifest, architectures, *flagSlim, out)
-
-	if err := out.Close(); err != nil {
-		log.Fatalf("failed to finish wrinting output: %v", err)
-	}
+	return nil, errors.New("please pass either --out-dir or --out-tar")
 }
 
 type vfsTargetLayer struct {
@@ -163,7 +290,9 @@ func (v *vfsTargetLayer) Close() error {
 	if err != nil {
 		return fmt.Errorf("failed to encode VFS overlay metadata: %w", err)
 	}
-	v.t.Create("vfsoverlay.yaml", int64(len(vfsRaw)), time.Now())
+	if err := v.t.Create("vfsoverlay.yaml", int64(len(vfsRaw)), time.Now()); err != nil {
+		return fmt.Errorf("failed to create VFS overlay output: %w", err)
+	}
 	if _, err := v.t.Write(vfsRaw); err != nil {
 		return fmt.Errorf("failed to write VFS overlay: %w", err)
 	}
@@ -183,6 +312,7 @@ func newArchiveTarget(name string) (*archiveTarget, error) {
 	}
 	outComp, err := zstd.NewWriter(outFile)
 	if err != nil {
+		outFile.Close()
 		return nil, fmt.Errorf("failed to initialize zstd compressor: %w", err)
 	}
 	out := tar.NewWriter(outComp)
@@ -200,10 +330,7 @@ func (a *archiveTarget) Close() error {
 	if err := a.outComp.Close(); err != nil {
 		return err
 	}
-	if err := a.outFile.Close(); err != nil {
-		return err
-	}
-	return nil
+	return a.outFile.Close()
 }
 
 func (a *archiveTarget) Create(path string, size int64, modTime time.Time) error {
@@ -226,7 +353,9 @@ type directoryTarget struct {
 
 func (d *directoryTarget) Create(path string, size int64, modTime time.Time) error {
 	if d.currFile != nil {
-		d.currFile.Close()
+		if err := d.currFile.Close(); err != nil {
+			return err
+		}
 	}
 	targetPath := filepath.Join(d.rootDir, filepath.FromSlash(path))
 	f, err := os.Create(targetPath)
