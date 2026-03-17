@@ -33,12 +33,6 @@ winsysroot --out-dir=somewere/my-sysroot
 
 The full option list can be shown using `--help`.
 
-To emit the list of artifacts (URLs + hashes + sizes) without assembling a sysroot, use:
-
-```sh
-winsysroot --win-sdk-version=10.0.26100 --architectures=x64,arm64 --out-manifest=downloads.json
-```
-
 Note that this does NOT need a case-insensitive directory on Linux/MacOS. It doesn't break it, but
 it is also not required.
 

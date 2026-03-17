@@ -3,7 +3,6 @@ package main
 import (
 	"archive/zip"
 	"bytes"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -19,14 +18,33 @@ var archTools = map[string]string{
 }
 
 func buildVCTools(manifest InstallerManifest, architectures []string, slim bool, out TargetI) {
-	pkgs, err := selectVCToolPackages(manifest, architectures)
-	if err != nil {
-		log.Fatal(err)
+	pkgs := make(map[string]Package)
+	var chase func(ids map[string]interface{})
+	chase = func(ids map[string]interface{}) {
+		for _, pkg := range manifest.Packages {
+			if _, ok := ids[pkg.ID]; !ok {
+				continue
+			}
+			if _, ok := pkgs[pkg.ID]; ok {
+				continue
+			}
+			pkgs[pkg.ID] = pkg
+			if len(pkg.Dependencies) > 0 {
+				chase(pkg.Dependencies)
+			}
+		}
 	}
 	hasArch := make(map[string]bool)
+	roots := make(map[string]interface{})
 	for _, arch := range architectures {
+		component := archTools[arch]
+		if component == "" {
+			log.Fatalf("unknown architecture %q, don't know the correct tools package", arch)
+		}
+		roots[component] = true
 		hasArch[arch] = true
 	}
+	chase(roots)
 	log.Printf("Downloading %d packages", len(pkgs))
 	for _, pkg := range pkgs {
 		if !strings.EqualFold(pkg.Type, "vsix") {
@@ -69,33 +87,4 @@ func buildVCTools(manifest InstallerManifest, architectures []string, slim bool,
 			f.Close()
 		}
 	}
-}
-
-func selectVCToolPackages(manifest InstallerManifest, architectures []string) (map[string]Package, error) {
-	pkgs := make(map[string]Package)
-	var chase func(ids map[string]interface{})
-	chase = func(ids map[string]interface{}) {
-		for _, pkg := range manifest.Packages {
-			if _, ok := ids[pkg.ID]; !ok {
-				continue
-			}
-			if _, ok := pkgs[pkg.ID]; ok {
-				continue
-			}
-			pkgs[pkg.ID] = pkg
-			if len(pkg.Dependencies) > 0 {
-				chase(pkg.Dependencies)
-			}
-		}
-	}
-	roots := make(map[string]interface{})
-	for _, arch := range architectures {
-		component := archTools[arch]
-		if component == "" {
-			return nil, fmt.Errorf("unknown architecture %q, don't know the correct tools package", arch)
-		}
-		roots[component] = true
-	}
-	chase(roots)
-	return pkgs, nil
 }
