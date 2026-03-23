@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"path"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -136,6 +135,10 @@ func getModernName(name string) string {
 	return parts[len(parts)-1]
 }
 
+func joinMSIPath(dir, fileName string) string {
+	return path.Join(dir, getModernName(fileName))
+}
+
 type MSI struct {
 	// File name in CAB -> Final path
 	FileMap map[string]string
@@ -211,7 +214,7 @@ func Parse(reader io.ReaderAt) (*MSI, error) {
 	parseTable(rawTableData["File"], stringsList, &files)
 	fileToPath := make(map[string]string)
 	for _, f := range files {
-		fileToPath[f.File] = filepath.Join(componentDirMap[f.Component], getModernName(f.FileName))
+		fileToPath[f.File] = joinMSIPath(componentDirMap[f.Component], f.FileName)
 	}
 	var data MSI
 	data.FileMap = fileToPath

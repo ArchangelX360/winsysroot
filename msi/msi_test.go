@@ -25,3 +25,11 @@ func Test_decodeStringVector(t *testing.T) {
 		})
 	}
 }
+
+func Test_joinMSIPath_UsesForwardSlashes(t *testing.T) {
+	got := joinMSIPath("Windows Kits/10/Include/10.0.26100.0", "um|um")
+	want := "Windows Kits/10/Include/10.0.26100.0/um"
+	if got != want {
+		t.Fatalf("joinMSIPath() = %q, want %q", got, want)
+	}
+}
