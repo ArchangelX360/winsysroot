@@ -47,8 +47,13 @@ winsysroot assemble \
   --winsdk-msi-dir path/to/msis \
   --downloads-dir path/to/downloads \
   --out-dir somewere/my-sysroot \
+  --with-spaceless-aliases \
   --out-metadata path/to/versions.json
 ```
+
+`--with-spaceless-aliases` is optional and currently supported only with `--out-dir`. It mirrors
+assembled directory paths under aliases with spaces removed from each directory component, which is
+useful for consumers that cannot tolerate spaces in include or library search paths.
 
 You can list SDK versions from a local installer manifest using:
 

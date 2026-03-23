@@ -95,12 +95,16 @@ func runAssemble(args []string) {
 	outDir := fs.String("out-dir", "", "Output sysroot under this directory. Exclusive with --out-tar.")
 	outTar := fs.String("out-tar", "", "Output sysroot to a zstd-compressed tarball at the path given to this argument. Exclusive with --out-dir.")
 	outMetadata := fs.String("out-metadata", "", "Optional path for extracted version metadata JSON")
+	withSpacelessAliases := fs.Bool("with-spaceless-aliases", false, "Mirror assembled directory paths under aliases with spaces removed. Only supported with --out-dir.")
 	if err := fs.Parse(args); err != nil {
 		log.Fatal(err)
 	}
 	if *inManifest == "" || *winsdkMSIDir == "" || *downloadsDir == "" {
 		fs.Usage()
 		log.Fatal("assemble requires --in-manifest, --winsdk-msi-dir, and --downloads-dir")
+	}
+	if *withSpacelessAliases && *outDir == "" {
+		log.Fatal("--with-spaceless-aliases is only supported with --out-dir")
 	}
 
 	plan, err := loadDownloadPlan(*inManifest)
@@ -119,6 +123,11 @@ func runAssemble(args []string) {
 	}
 	if closeErr != nil {
 		log.Fatalf("failed to finish writing output: %v", closeErr)
+	}
+	if *withSpacelessAliases {
+		if err := createSpacelessAliases(*outDir); err != nil {
+			log.Fatal(err)
+		}
 	}
 	if *outMetadata != "" {
 		if err := writeJSONFile(*outMetadata, metadata); err != nil {
@@ -381,6 +390,131 @@ func (d *directoryTarget) Write(b []byte) (int, error) {
 func (d *directoryTarget) Close() error {
 	if d.currFile != nil {
 		return d.currFile.Close()
+	}
+	return nil
+}
+
+type pathAlias struct {
+	sourcePath string
+	aliasPath  string
+}
+
+func createSpacelessAliases(rootDir string) error {
+	var dirAliases []pathAlias
+	var fileAliases []pathAlias
+	err := filepath.WalkDir(rootDir, func(sourcePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if sourcePath == rootDir {
+			return nil
+		}
+
+		aliasPath, err := spacelessAliasPath(rootDir, sourcePath, entry.IsDir())
+		if err != nil {
+			return err
+		}
+		if aliasPath == "" {
+			return nil
+		}
+
+		alias := pathAlias{
+			sourcePath: sourcePath,
+			aliasPath:  aliasPath,
+		}
+		if entry.IsDir() {
+			dirAliases = append(dirAliases, alias)
+		} else {
+			fileAliases = append(fileAliases, alias)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, alias := range dirAliases {
+		if err := createAliasDirectory(alias.sourcePath, alias.aliasPath); err != nil {
+			return err
+		}
+	}
+	for _, alias := range fileAliases {
+		if err := createAliasFile(alias.sourcePath, alias.aliasPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func spacelessAliasPath(rootDir, sourcePath string, isDir bool) (string, error) {
+	relPath, err := filepath.Rel(rootDir, sourcePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute relative path for %s: %w", sourcePath, err)
+	}
+
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	limit := len(parts)
+	if !isDir {
+		limit--
+	}
+	changed := false
+	for i := 0; i < limit; i++ {
+		aliasPart := strings.ReplaceAll(parts[i], " ", "")
+		if aliasPart != parts[i] {
+			changed = true
+			parts[i] = aliasPart
+		}
+	}
+	if !changed {
+		return "", nil
+	}
+	return filepath.Join(append([]string{rootDir}, parts...)...), nil
+}
+
+func createAliasDirectory(sourcePath, aliasPath string) error {
+	if err := ensureAliasDoesNotExist(sourcePath, aliasPath); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(aliasPath, 0755); err != nil {
+		return fmt.Errorf("failed to create alias directory %s for %s: %w", aliasPath, sourcePath, err)
+	}
+	return nil
+}
+
+func createAliasFile(sourcePath, aliasPath string) error {
+	if err := ensureAliasDoesNotExist(sourcePath, aliasPath); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(aliasPath), 0755); err != nil {
+		return fmt.Errorf("failed to create parent directory for alias %s: %w", aliasPath, err)
+	}
+	if err := os.Link(sourcePath, aliasPath); err == nil {
+		return nil
+	}
+
+	sourceFile, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to open %s for alias copy: %w", sourcePath, err)
+	}
+	defer sourceFile.Close()
+
+	aliasFile, err := os.Create(aliasPath)
+	if err != nil {
+		return fmt.Errorf("failed to create alias file %s: %w", aliasPath, err)
+	}
+	defer aliasFile.Close()
+
+	if _, err := io.Copy(aliasFile, sourceFile); err != nil {
+		return fmt.Errorf("failed to copy %s to %s: %w", sourcePath, aliasPath, err)
+	}
+	return nil
+}
+
+func ensureAliasDoesNotExist(sourcePath, aliasPath string) error {
+	if _, err := os.Lstat(aliasPath); err == nil {
+		return fmt.Errorf("alias path %s for %s already exists", aliasPath, sourcePath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to stat alias path %s: %w", aliasPath, err)
 	}
 	return nil
 }
