@@ -4,10 +4,10 @@ _Automatically assemble Windows Sysroots directly from Microsoft sources_
 
 ## Features
 
-- Very small, minimal sysroots. The x64 tarball zstd-compressed is just 106MiB.
+- Very small, minimal sysroots.
 - Fully cross-platform, no proprietary code involved in the toolchain. Works with any
   properly-configured LLVM.
-- Very fast. The compressed x64 tarball takes ~20s to download and assemble.
+- Very fast for the amount of CAB and VSIX content it has to unpack.
 - Selectable Windows SDK version
 - Integrated VFS overlay to make it work on case-sensitive filesystems.
 - Near 100% compatibility with normal Microsoft MSVC. No Cygwin/MinGW/MSYS2.
@@ -24,49 +24,42 @@ It also requires LLVM 15 or higher with lld-link, which you need to install for 
 
 ## Usage
 
-`winsysroot` is now an offline tool. It does not issue HTTP requests itself; you are expected to
-download the Visual Studio installer manifest, the relevant Windows SDK MSI files, and the planned
-CAB/VSIX payloads externally.
+`winsysroot` is now a low-level offline tool. It does not issue HTTP requests itself and it no
+longer owns manifest resolution or download planning. The intended flow is that Bazel repository
+rules or another external orchestrator decide what to download and what to extract, and `winsysroot`
+only handles opaque Windows archive formats.
 
-The primary workflow is:
-
-```sh
-winsysroot plan \
-  --installer-manifest path/to/installer-manifest.json \
-  --winsdk-msi-dir path/to/msis \
-  --win-sdk-version 10.0.26100 \
-  --architectures x64,arm64 \
-  --out-manifest path/to/download-plan.json
-```
-
-followed by:
+The primitive commands are:
 
 ```sh
-winsysroot assemble \
-  --in-manifest path/to/download-plan.json \
-  --winsdk-msi-dir path/to/msis \
-  --downloads-dir path/to/downloads \
-  --out-dir somewere/my-sysroot \
-  --with-spaceless-aliases \
-  --out-metadata path/to/versions.json
+winsysroot msi-info --input path/to/sdk.msi
+winsysroot cab-extract --layout path/to/layout.json --out-dir path/to/sysroot --cab path/to/a.cab --cab path/to/b.cab
+winsysroot zip-list --input path/to/toolset.vsix
+winsysroot zip-extract --input path/to/toolset.vsix --layout path/to/layout.json --out-dir path/to/sysroot
+winsysroot write-vfs --root-dir path/to/sysroot
+winsysroot make-spaceless-aliases --root-dir path/to/sysroot
 ```
 
-`--with-spaceless-aliases` is optional and currently supported only with `--out-dir`. It mirrors
-assembled directory paths under aliases with spaces removed from each directory component, which is
-useful for consumers that cannot tolerate spaces in include or library search paths.
-
-You can list SDK versions from a local installer manifest using:
+`msi-info` prints CAB membership and MSI file mappings as JSON. `cab-extract` and `zip-extract`
+consume a private JSON layout file with entries of the form:
 
 ```sh
-winsysroot list-win-sdk-versions --installer-manifest path/to/installer-manifest.json
+{
+  "entries": [
+    {
+      "archive_path": "ARCHIVE_MEMBER_NAME",
+      "output_path": "relative/output/path"
+    }
+  ]
+}
 ```
 
-The full option list can be shown using `winsysroot help`.
+The full option list can be shown using `winsysroot help`. Note that this does NOT need a
+case-insensitive directory on Linux/MacOS. It doesn't break it, but it is also not required.
 
-Note that this does NOT need a case-insensitive directory on Linux/MacOS. It doesn't break it, but
-it is also not required.
-
-This sysroot can then be used either standalone or with the included wrapper scripts:
+If you are assembling a standalone sysroot outside Bazel, generate `vfsoverlay.yaml` with
+`write-vfs` after extraction and before creating spaceless aliases. The included wrapper scripts
+still expect that overlay file:
 
 ```sh
 WINSYSROOT=somewere/my-sysroot wrappers/clang-cl-x64 /o examples/helloworld-x64.exe examples/helloworld.cc
@@ -78,9 +71,6 @@ it is in your environment.
 ## Notes
 
 - arm64ec is VERY new and as of LLVM 15 does not fully work.
-- The tarball has a hardcoded VFS location at /winsysroot which you need to change to the real
-  unpacked path as the driver discovery does not go through the VFS overlay yet and thus passing
-  /winsysroot as path doesn't work.
 
 ## Is this legal?
 
