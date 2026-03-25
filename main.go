@@ -25,8 +25,6 @@ func main() {
 		runZIPExtract(os.Args[2:])
 	case "write-vfs":
 		runWriteVFS(os.Args[2:])
-	case "make-spaceless-aliases":
-		runMakeSpacelessAliases(os.Args[2:])
 	case "help", "-h", "--help":
 		printUsageAndExit()
 	default:
@@ -41,7 +39,6 @@ func printUsageAndExit() {
 	fmt.Fprintf(os.Stderr, "  winsysroot zip-list --input <path> [--out <path>]\n")
 	fmt.Fprintf(os.Stderr, "  winsysroot zip-extract --input <path> --layout <path> --out-dir <dir>\n")
 	fmt.Fprintf(os.Stderr, "  winsysroot write-vfs --root-dir <dir> [--virtual-root <path>] [--out <path>]\n")
-	fmt.Fprintf(os.Stderr, "  winsysroot make-spaceless-aliases --root-dir <dir>\n")
 	os.Exit(2)
 }
 

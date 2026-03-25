@@ -37,7 +37,6 @@ winsysroot cab-extract --layout path/to/layout.json --out-dir path/to/sysroot --
 winsysroot zip-list --input path/to/toolset.vsix
 winsysroot zip-extract --input path/to/toolset.vsix --layout path/to/layout.json --out-dir path/to/sysroot
 winsysroot write-vfs --root-dir path/to/sysroot
-winsysroot make-spaceless-aliases --root-dir path/to/sysroot
 ```
 
 `msi-info` prints CAB membership and MSI file mappings as JSON. `cab-extract` and `zip-extract`
@@ -58,8 +57,7 @@ The full option list can be shown using `winsysroot help`. Note that this does N
 case-insensitive directory on Linux/MacOS. It doesn't break it, but it is also not required.
 
 If you are assembling a standalone sysroot outside Bazel, generate `vfsoverlay.yaml` with
-`write-vfs` after extraction and before creating spaceless aliases. The included wrapper scripts
-still expect that overlay file:
+`write-vfs` after extraction. The included wrapper scripts still expect that overlay file:
 
 ```sh
 WINSYSROOT=somewere/my-sysroot wrappers/clang-cl-x64 /o examples/helloworld-x64.exe examples/helloworld.cc
